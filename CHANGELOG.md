@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- sracha sends the NCBI API key from the `NCBI_API_KEY` environment variable
+  with its EUtils requests (ESearch and EFetch). NCBI then allows 10 requests
+  per second instead of 3, which helps when many sracha processes run at the
+  same time. The key goes in the POST body, so it never appears in a URL or a
+  log. ESearch now uses POST instead of GET. If NCBI rejects the key, sracha
+  prints one clear error and stops sending EUtils requests. Project accessions
+  then fail, and runs continue without RunInfo metadata.
+
 ## 0.10.1 (2026-11-01)
 
 ### Fixes

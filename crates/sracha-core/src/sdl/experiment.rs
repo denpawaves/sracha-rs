@@ -11,7 +11,10 @@
 
 use std::collections::HashMap;
 
-use super::{EFETCH_BATCH_SIZE, EUTILS_EFETCH_URL, send_with_retry};
+use super::{
+    EFETCH_BATCH_SIZE, EUTILS_EFETCH_URL, api_key_already_rejected, api_key_rejected, eutils_form,
+    send_with_retry,
+};
 
 /// Packages carry a submitter block and sample attributes, so they are far
 /// bigger than a RunInfo CSV row; keep each response modest.
@@ -114,14 +117,25 @@ async fn fetch_experiment_info_from(
     let work = async {
         let mut out = HashMap::new();
         for chunk in runs.chunks(XML_BATCH_SIZE) {
+            if api_key_already_rejected() {
+                break;
+            }
             let ids = chunk.join(",");
-            let form = [("db", "sra"), ("id", ids.as_str()), ("retmode", "xml")];
+            let form = eutils_form(vec![
+                ("db", "sra"),
+                ("id", ids.as_str()),
+                ("retmode", "xml"),
+            ]);
             let resp =
                 send_with_retry("EUtils EFetch XML (POST)", || client.post(url).form(&form)).await;
             let body = match resp {
                 Ok(r) if r.status().is_success() => r.text().await.ok(),
                 Ok(r) => {
-                    tracing::debug!("EFetch XML returned HTTP {}", r.status());
+                    let status = r.status();
+                    if api_key_rejected(r).await {
+                        break;
+                    }
+                    tracing::debug!("EFetch XML returned HTTP {status}");
                     None
                 }
                 Err(e) => {

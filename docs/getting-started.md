@@ -39,6 +39,27 @@ sracha get SRP123456
 sracha resolves project and study accessions to individual runs via the
 NCBI EUtils API, then processes each run.
 
+## NCBI API key
+
+sracha also uses EUtils to read run metadata. Without a key, NCBI allows 3
+EUtils requests per second from one IP address, and 10 with a key. If you run
+many sracha processes at the same time, for example on a cluster, set your NCBI API key in the `NCBI_API_KEY` environment variable. You can
+create a key in your
+[NCBI account settings](https://www.ncbi.nlm.nih.gov/account/settings/).
+
+```bash
+export NCBI_API_KEY=your_key_here
+sracha get PRJNA675068
+```
+
+sracha sends the key in the body of each EUtils request, so the key does not
+appear in URLs or logs. Downloads of the SRA files do not use the key.
+
+If NCBI rejects the key, sracha prints one error that names `NCBI_API_KEY`
+and stops sending EUtils requests. Project and study accessions then fail.
+Run accessions still download, but without the RunInfo metadata. To fix
+this, correct the key or unset `NCBI_API_KEY`.
+
 ## Accession lists
 
 For batch downloads, create a text file with one accession per line:

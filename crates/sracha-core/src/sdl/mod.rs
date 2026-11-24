@@ -5,6 +5,8 @@ pub use experiment::{ExperimentInfo, fetch_experiment_info, parse_experiment_pac
 pub use response::*;
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::accession::{ProjectAccession, ProjectKind};
 use crate::error::{Error, Result};
@@ -78,6 +80,72 @@ async fn http_get_with_retry(
     send_with_retry(url, || client.get(url)).await
 }
 
+/// NCBI API key from the `NCBI_API_KEY` environment variable, read once.
+///
+/// EUtils allows 10 requests/s with a key and 3 without. The key goes in the
+/// POST body of every EUtils request (see [`eutils_form`]), never in a URL,
+/// so it cannot leak into logs or `reqwest` error messages.
+static NCBI_API_KEY: LazyLock<Option<String>> = LazyLock::new(|| {
+    let key = std::env::var("NCBI_API_KEY")
+        .ok()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
+    if key.is_some() {
+        tracing::debug!("using NCBI API key from NCBI_API_KEY for EUtils requests");
+    }
+    key
+});
+
+/// Append `api_key` to an EUtils form when a key is set.
+fn with_api_key<'a>(
+    mut form: Vec<(&'a str, &'a str)>,
+    key: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    if let Some(key) = key {
+        form.push(("api_key", key));
+    }
+    form
+}
+
+/// An EUtils POST form with the `NCBI_API_KEY` key added when it is set.
+fn eutils_form<'a>(form: Vec<(&'a str, &'a str)>) -> Vec<(&'a str, &'a str)> {
+    with_api_key(form, NCBI_API_KEY.as_deref())
+}
+
+const INVALID_API_KEY_MSG: &str = "NCBI rejected the API key in NCBI_API_KEY (\"API key invalid\"). \
+     Correct the key or unset NCBI_API_KEY.";
+
+/// Set once NCBI rejects the key, so later EUtils calls skip the request
+/// (and its retries) instead of failing the same way again.
+static API_KEY_REJECTED: AtomicBool = AtomicBool::new(false);
+
+/// NCBI answers a bad key with HTTP 400 and `{"error":"API key invalid",...}`.
+fn is_invalid_api_key(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST && body.contains("API key invalid")
+}
+
+/// Whether NCBI already rejected the key during this run.
+fn api_key_already_rejected() -> bool {
+    API_KEY_REJECTED.load(Ordering::Relaxed)
+}
+
+/// For a failed EUtils response: whether NCBI rejected our API key.
+///
+/// Logs one clear error per process. Never logs the body, because NCBI
+/// echoes the key in it.
+async fn api_key_rejected(resp: reqwest::Response) -> bool {
+    if NCBI_API_KEY.is_none() || resp.status() != reqwest::StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let rejected = is_invalid_api_key(status, &body);
+    if rejected && !API_KEY_REJECTED.swap(true, Ordering::Relaxed) {
+        tracing::error!("{INVALID_API_KEY_MSG}");
+    }
+    rejected
+}
+
 /// EUtils EFetch RunInfo via HTTP POST (`id` in the body, not the URL).
 ///
 /// POST is the NCBI-recommended transport for large UID lists and has no
@@ -86,12 +154,12 @@ async fn efetch_runinfo_post(
     client: &reqwest::Client,
     ids: &str,
 ) -> std::result::Result<reqwest::Response, reqwest::Error> {
-    let form = [
+    let form = eutils_form(vec![
         ("db", "sra"),
         ("id", ids),
         ("rettype", "runinfo"),
         ("retmode", "text"),
-    ];
+    ]);
     send_with_retry("EUtils EFetch (POST)", || {
         client.post(EUTILS_EFETCH_URL).form(&form)
     })
@@ -501,6 +569,10 @@ impl SdlClient {
             }
         }
 
+        if api_key_already_rejected() {
+            return result;
+        }
+
         for attempt in 0..=MAX_API_RETRIES {
             for chunk in pending.chunks(EFETCH_BATCH_SIZE) {
                 let ids = chunk.join(",");
@@ -516,7 +588,12 @@ impl SdlClient {
                 };
 
                 if !resp.status().is_success() {
-                    tracing::warn!("EUtils RunInfo batch HTTP {}", resp.status());
+                    let status = resp.status();
+                    // A rejected key fails the same way on every retry.
+                    if api_key_rejected(resp).await {
+                        return result;
+                    }
+                    tracing::warn!("EUtils RunInfo batch HTTP {status}");
                     continue;
                 }
 
@@ -576,21 +653,31 @@ impl SdlClient {
 
         tracing::info!("{accession}: resolving project to run accessions via EUtils");
 
-        // Step 1: ESearch to get SRA UIDs.
-        let search_url =
-            format!("{EUTILS_ESEARCH_URL}?db=sra&term={term}&retmax=10000&retmode=json");
-        tracing::debug!("ESearch request: {search_url}");
+        // Step 1: ESearch to get SRA UIDs. POST keeps the API key out of the URL.
+        tracing::debug!("ESearch request: db=sra term={term}");
+        let form = eutils_form(vec![
+            ("db", "sra"),
+            ("term", &term),
+            ("retmax", "10000"),
+            ("retmode", "json"),
+        ]);
 
-        let resp = http_get_with_retry(&self.http, &search_url)
-            .await
-            .map_err(|e| Error::Sdl {
-                message: format!("{accession}: ESearch request failed: {e}"),
-            })?;
+        let resp = send_with_retry("EUtils ESearch (POST)", || {
+            self.http.post(EUTILS_ESEARCH_URL).form(&form)
+        })
+        .await
+        .map_err(|e| Error::Sdl {
+            message: format!("{accession}: ESearch request failed: {e}"),
+        })?;
 
         if !resp.status().is_success() {
-            return Err(Error::Sdl {
-                message: format!("{accession}: ESearch HTTP {}", resp.status()),
-            });
+            let status = resp.status();
+            let message = if api_key_rejected(resp).await {
+                format!("{accession}: {INVALID_API_KEY_MSG}")
+            } else {
+                format!("{accession}: ESearch HTTP {status}")
+            };
+            return Err(Error::Sdl { message });
         }
 
         let body: serde_json::Value = resp.json().await.map_err(|e| Error::Sdl {
@@ -633,9 +720,13 @@ impl SdlClient {
                 })?;
 
             if !resp.status().is_success() {
-                return Err(Error::Sdl {
-                    message: format!("{accession}: EFetch HTTP {}", resp.status()),
-                });
+                let status = resp.status();
+                let message = if api_key_rejected(resp).await {
+                    format!("{accession}: {INVALID_API_KEY_MSG}")
+                } else {
+                    format!("{accession}: EFetch HTTP {status}")
+                };
+                return Err(Error::Sdl { message });
             }
 
             let csv_body = resp.text().await.map_err(|e| Error::Sdl {
@@ -925,6 +1016,33 @@ impl Default for SdlClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_api_key_appends_key_when_set() {
+        let form = with_api_key(vec![("db", "sra"), ("id", "SRR1")], Some("abc123"));
+        assert_eq!(
+            form,
+            vec![("db", "sra"), ("id", "SRR1"), ("api_key", "abc123")]
+        );
+    }
+
+    #[test]
+    fn detects_ncbi_invalid_api_key_response() {
+        let body =
+            r#"{"error":"API key invalid","api-key":"x","type":"invalid","status":"unknown"}"#;
+        assert!(is_invalid_api_key(reqwest::StatusCode::BAD_REQUEST, body));
+        assert!(!is_invalid_api_key(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"other"}"#
+        ));
+        assert!(!is_invalid_api_key(reqwest::StatusCode::OK, body));
+    }
+
+    #[test]
+    fn with_api_key_leaves_form_unchanged_without_key() {
+        let form = with_api_key(vec![("db", "sra"), ("id", "SRR1")], None);
+        assert_eq!(form, vec![("db", "sra"), ("id", "SRR1")]);
+    }
 
     fn make_sdl_file(
         file_type: &str,
